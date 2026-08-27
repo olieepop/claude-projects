@@ -1,5 +1,24 @@
 # Daily Inbox Briefing
 
+> **Retired — Aug 2026.** Claude Cowork now has a native daily briefing built in, so I stopped running this custom version. Leaving the code and docs here in case the Notion + iMessage routing is useful to someone (or future me). Full comparison below if you're deciding which one to use.
+
+## Why I retired it
+
+Cowork's built-in briefing does the core job — pull your morning context, prioritize it, hand you a summary — without me maintaining connector IDs and a SKILL.md by hand. It's just less specific than what I'd wired up.
+
+| | This custom build | Cowork's native briefing |
+|---|---|---|
+| Sources | Gmail only | Gmail, Calendar, Slack, Sentry, web, local files |
+| Delivery | iMessage text + Notion to-dos | Cowork window, or email/Slack |
+| Setup | Connect 3 MCP servers, edit SKILL.md by hand, build a Notion database | Connect once, point a scheduled task at it — a few minutes |
+| Where it runs | Needs a scheduled agent session | Runs on Anthropic's servers, no machine required |
+| Tuning | Fully custom — classification rules, message format, all editable | Handles the reasoning for you, less to tweak |
+| Cost | Free (your own connectors) | Included in Claude Pro / Cowork |
+
+If you specifically want the iMessage-to-phone + Notion-logging workflow, this repo still does that and the native version doesn't (yet). That's the one reason I'd come back to it.
+
+---
+
 This is another test to leverage AI to automate some recurring daily admin work. I leveraged Claude Cowork's scheduled task that runs every morning at 7am to triage my Gmail inbox, send a concise iMessage summary to my phone, and log action items directly into a Notion database — no manual effort required.
 
 I initially wanted to only apps within my phone (e.g. Reminders to-dos) but you will need to grant the permission while your laptop is awake (?). If you came across this repo and have answer, please let me know bc moving it to Notion somehow is not as clean as how I want it. But for any of you don't mind using Notion or has been a power user, feel free to leverage below process to make your life easier. 
