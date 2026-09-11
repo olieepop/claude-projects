@@ -1,0 +1,5 @@
+# Pinned, matches video-autopilot-kit's runtime contract exactly -- keep in sync so vendored
+# src/filter_runtime.py etc. behave the same here as upstream.
+Pillow==11.3.0
+numpy==2.0.2
+opencv-contrib-python-headless==4.12.0.88
