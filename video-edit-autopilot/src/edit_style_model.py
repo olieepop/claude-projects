@@ -27,6 +27,15 @@ list is ranked by *frequency observed in your own pairs* — per this kit's
 existing philosophy (see templates/audience_vocab.example.json): audited
 from your own transcripts, never copied from someone else's.
 
+Diffs on the full concatenated transcript text, character by character, not
+block-by-block (see rough_cut.py's reconstruct_cuts, which this mirrors) --
+a raw ASR pass and a human-cleaned pass routinely chunk the same sentence
+into different-sized blocks, and comparing block-to-block reads every one of
+those boundary shifts as a false cut. MIN_CONFIDENT_CUT_SEC/CHAR_MIN_CONFIDENT_CUT
+drop spans too short to be anything but ASR noise or a homophone mismatch;
+TANGENT_MIN_SEC is a calibration knob, not a universal constant -- recheck it
+against your own footage once you have more pairs.
+
 CLI:
     python src/edit_style_model.py learn \\
         --pair raw1.txt=final1.txt --pair raw2.txt=final2.txt \\
@@ -50,10 +59,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: char-level diff (see diff_pair); per_pair now reports chars, not blocks
 CJK_RE = re.compile(r"[一-鿿]")
-SHORT_BLOCK_CHARS = 8     # <= this many "words" -> candidate filler/reaction, not content
-TANGENT_RUN_MIN = 3       # >= this many consecutive removed blocks -> candidate tangent
+SHORT_BLOCK_CHARS = 8         # <= this many "words" -> candidate filler/reaction, not content
+CHAR_MIN_CONFIDENT_CUT = 4    # shorter char spans are stray/noise, not a cut worth reporting
+MIN_CONFIDENT_CUT_SEC = 1.2   # shorter time spans are likely ASR/homophone mismatch, not a real cut
+TANGENT_MIN_SEC = 8.0         # cut spans at least this long are a tangent, not a filler/reaction word
 
 
 @dataclass
@@ -116,9 +127,10 @@ def normalize(text: str) -> str:
 @dataclass
 class PairReport:
     pair_name: str
-    pre_total: int
-    matched: int
-    retention_ratio: float
+    pre_total: int   # pre-transcript block count (display only)
+    matched: int     # matched characters -- see diff_pair
+    pre_chars: int = 0
+    retention_ratio: float = 0.0
     filler_or_reaction_cuts: list[str] = field(default_factory=list)
     tangent_cuts: list[dict[str, Any]] = field(default_factory=list)
     content_cuts: list[str] = field(default_factory=list)
@@ -152,25 +164,6 @@ def select_canonical_blocks(blocks: list[Block]) -> list[Block]:
     return [b for b in blocks if b.canonical]
 
 
-def _handle_delete(run: list[Block], report: PairReport) -> None:
-    try:
-        report.cut_ranges.append((ts_to_seconds(run[0].start), ts_to_seconds(run[-1].end)))
-    except (ValueError, IndexError):
-        pass
-    if len(run) >= TANGENT_RUN_MIN:
-        report.tangent_cuts.append({
-            "blocks": len(run),
-            "preview": " | ".join(b.canonical for b in run[:3]) + (" ..." if len(run) > 3 else ""),
-            "full_text": [b.canonical for b in run],
-        })
-    else:
-        for b in run:
-            if len(b.canonical) <= SHORT_BLOCK_CHARS:
-                report.filler_or_reaction_cuts.append(b.canonical)
-            else:
-                report.content_cuts.append(b.canonical)
-
-
 def _handle_insert(run: list[Block], global_j_start: int, report: PairReport) -> None:
     for offset, b in enumerate(run):
         if global_j_start + offset <= 3:
@@ -179,70 +172,53 @@ def _handle_insert(run: list[Block], global_j_start: int, report: PairReport) ->
             report.added_other.append(b.canonical)
 
 
-def _walk(
-    pre_run: list[Block],
-    post_run: list[Block],
-    global_j_start: int,
-    report: PairReport,
-    depth: int = 0,
-) -> int:
-    """Return matched-block count; append findings to report as it goes.
+def _char_time_index(blocks: list[Block]) -> tuple[str, list[tuple[int, int, float, float, Block]]]:
+    """Concatenate every block's normalized text into one string and index
+    each contiguous char span back to its timestamp range and source block.
 
-    Recurses into oversized/mismatched "replace" spans so a genuine bulk
-    cut (e.g. a whole tangent trimmed down to one bridging line) isn't
-    force-paired position-by-position into nonsense "rewrites" — it finds
-    the real small overlap first and reports the rest as cuts/additions.
-    """
-    if not pre_run:
-        _handle_insert(post_run, global_j_start, report)
-        return 0
-    if not post_run:
-        _handle_delete(pre_run, report)
-        return 0
+    Diffing this string (see diff_pair) instead of the block list itself is
+    what makes the result immune to resegmentation: the same sentence can
+    land in one block in the raw ASR pass and three blocks in the cleaned
+    pass without ever registering as a cut, because the character stream is
+    identical either way -- only the span boundaries move."""
+    parts: list[str] = []
+    index: list[tuple[int, int, float, float, Block]] = []
+    pos = 0
+    for b in blocks:
+        text = normalize(b.canonical)
+        if not text:
+            continue
+        try:
+            start, end = ts_to_seconds(b.start), ts_to_seconds(b.end)
+        except ValueError:
+            continue
+        parts.append(text)
+        index.append((pos, pos + len(text), start, end, b))
+        pos += len(text)
+    return "".join(parts), index
 
-    def _base_case() -> None:
-        if len(pre_run) == len(post_run):
-            # Clean 1:1 swap -> genuine rewrite pairs (typo/homophone fixes).
-            for p, q in zip(pre_run, post_run):
-                report.rewrites.append({"pre": p.canonical, "post": q.canonical})
-        else:
-            # Sizes differ with no further internal overlap found -> an
-            # honest bulk cut plus separately whatever appeared new, rather
-            # than pretending a false position-by-position correspondence.
-            _handle_delete(pre_run, report)
-            _handle_insert(post_run, global_j_start, report)
 
-    if depth >= 4 or (len(pre_run) <= 2 and len(post_run) <= 2):
-        _base_case()
-        return 0
+def _char_to_time(char_idx: int, index: list[tuple[int, int, float, float, Block]]) -> float:
+    if not index:
+        return 0.0
+    for start_char, end_char, start_sec, end_sec, _ in index:
+        if char_idx <= end_char:
+            span = max(end_char - start_char, 1)
+            frac = (char_idx - start_char) / span
+            return start_sec + frac * (end_sec - start_sec)
+    return index[-1][3]
 
-    pre_keys = [normalize(b.canonical) for b in pre_run]
-    post_keys = [normalize(b.canonical) for b in post_run]
-    sm = SequenceMatcher(a=pre_keys, b=post_keys, autojunk=False)
-    opcodes = sm.get_opcodes()
 
-    if len(opcodes) == 1 and opcodes[0][0] == "replace":
-        # No progress possible at this depth -> base case, avoids recursing
-        # forever on a span with zero internal overlap.
-        _base_case()
-        return 0
-
-    matched = 0
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag == "equal":
-            matched += i2 - i1
-        elif tag == "delete":
-            _handle_delete(pre_run[i1:i2], report)
-        elif tag == "insert":
-            _handle_insert(post_run[j1:j2], global_j_start + j1, report)
-        elif tag == "replace":
-            matched += _walk(pre_run[i1:i2], post_run[j1:j2], global_j_start + j1, report, depth + 1)
-    return matched
+def _blocks_for_span(index: list[tuple[int, int, float, float, Block]], i1: int, i2: int) -> list[Block]:
+    return [b for start_char, end_char, _, _, b in index if end_char > i1 and start_char < i2]
 
 
 def diff_pair(pre_path: Path, post_path: Path) -> PairReport:
     pre_blocks = select_canonical_blocks(parse_transcript(pre_path))
     post_blocks = select_canonical_blocks(parse_transcript(post_path))
+
+    pre_text, pre_index = _char_time_index(pre_blocks)
+    post_text, post_index = _char_time_index(post_blocks)
 
     report = PairReport(
         pair_name=f"{pre_path.name}->{post_path.name}",
@@ -250,8 +226,59 @@ def diff_pair(pre_path: Path, post_path: Path) -> PairReport:
         matched=0,
         retention_ratio=0.0,
     )
-    report.matched = _walk(pre_blocks, post_blocks, 0, report)
-    report.retention_ratio = round(report.matched / report.pre_total, 3) if report.pre_total else 0.0
+
+    matched_chars = 0
+    sm = SequenceMatcher(a=pre_text, b=post_text, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            matched_chars += i2 - i1
+            continue
+        if tag == "insert":
+            _handle_insert(_blocks_for_span(post_index, j1, j2), j1, report)
+            continue
+
+        # "delete" or "replace": the pre span [i1,i2) is missing (or reworded) in post.
+        pre_span_blocks = _blocks_for_span(pre_index, i1, i2)
+        if not pre_span_blocks:
+            continue
+        span_chars = i2 - i1
+        post_span_chars = j2 - j1
+
+        if tag == "replace" and post_span_chars >= span_chars * 0.4:
+            # Comparable length on both sides -> a genuine rewrite (typo,
+            # homophone, phrasing fix), not a cut.
+            report.rewrites.append({
+                "pre": "".join(b.canonical for b in pre_span_blocks),
+                "post": "".join(b.canonical for b in _blocks_for_span(post_index, j1, j2)),
+            })
+            matched_chars += min(span_chars, post_span_chars)
+            continue
+
+        start_sec = _char_to_time(i1, pre_index)
+        end_sec = _char_to_time(i2, pre_index)
+        span_sec = end_sec - start_sec
+        if span_chars < CHAR_MIN_CONFIDENT_CUT or span_sec < MIN_CONFIDENT_CUT_SEC:
+            continue  # too short/isolated to trust -- ASR noise or a homophone mismatch, not a real cut
+
+        report.cut_ranges.append((start_sec, end_sec))
+        if span_sec >= TANGENT_MIN_SEC:
+            report.tangent_cuts.append({
+                "blocks": len(pre_span_blocks),
+                "preview": " | ".join(b.canonical for b in pre_span_blocks[:3]) + (" ..." if len(pre_span_blocks) > 3 else ""),
+                "full_text": [b.canonical for b in pre_span_blocks],
+            })
+        else:
+            for b in pre_span_blocks:
+                if len(b.canonical) <= SHORT_BLOCK_CHARS:
+                    report.filler_or_reaction_cuts.append(b.canonical)
+                else:
+                    report.content_cuts.append(b.canonical)
+        if tag == "replace":
+            _handle_insert(_blocks_for_span(post_index, j1, j2), j1, report)
+
+    report.matched = matched_chars
+    report.pre_chars = len(pre_text)
+    report.retention_ratio = round(matched_chars / report.pre_chars, 3) if report.pre_chars else 0.0
 
     return report
 
@@ -262,6 +289,21 @@ def build_profile(reports: list[PairReport]) -> dict[str, Any]:
         filler_counter.update(r.filler_or_reaction_cuts)
 
     avg_retention = round(sum(r.retention_ratio for r in reports) / len(reports), 3) if reports else 0.0
+
+    def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # A block straddling two adjacent diff opcodes can get attributed to
+        # both (see _blocks_for_span's overlap test) -- same finding reported
+        # twice back to back. Order-preserving dedupe on the full entry (json
+        # key, not tuple(sorted(...)), since values here include lists).
+        seen: set[str] = set()
+        out = []
+        for item in items:
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
 
     return {
         "_readme": (
@@ -276,15 +318,15 @@ def build_profile(reports: list[PairReport]) -> dict[str, Any]:
         "frequent_filler_or_reaction_cuts": [
             {"text": text, "seen_in_pairs": count} for text, count in filler_counter.most_common(30)
         ],
-        "tangent_cuts_for_review": [
-            {"pair": r.pair_name, **t} for r in reports for t in r.tangent_cuts
-        ],
-        "single_line_content_cuts_for_review": [
-            {"pair": r.pair_name, "text": t} for r in reports for t in r.content_cuts
-        ],
-        "rewrites_for_review": [
-            {"pair": r.pair_name, **rw} for r in reports for rw in r.rewrites
-        ],
+        "tangent_cuts_for_review": _dedupe(
+            [{"pair": r.pair_name, **t} for r in reports for t in r.tangent_cuts]
+        ),
+        "single_line_content_cuts_for_review": _dedupe(
+            [{"pair": r.pair_name, "text": t} for r in reports for t in r.content_cuts]
+        ),
+        "rewrites_for_review": _dedupe(
+            [{"pair": r.pair_name, **rw} for r in reports for rw in r.rewrites]
+        ),
         "added_hooks_for_review": [
             {"pair": r.pair_name, "text": t} for r in reports for t in r.added_hook
         ],
@@ -295,7 +337,8 @@ def build_profile(reports: list[PairReport]) -> dict[str, Any]:
             {
                 "pair": r.pair_name,
                 "pre_blocks": r.pre_total,
-                "matched_blocks": r.matched,
+                "pre_chars": r.pre_chars,
+                "matched_chars": r.matched,
                 "retention_ratio": r.retention_ratio,
             }
             for r in reports
@@ -353,10 +396,10 @@ def render_markdown(profile: dict[str, Any]) -> str:
         lines.append("- (none found)")
 
     lines.append("\n## Per-pair stats\n")
-    lines.append("| pair | raw blocks | kept | retention |")
-    lines.append("|---|---|---|---|")
+    lines.append("| pair | raw blocks | raw chars | matched chars | retention |")
+    lines.append("|---|---|---|---|---|")
     for p in profile["per_pair"]:
-        lines.append(f"| {p['pair']} | {p['pre_blocks']} | {p['matched_blocks']} | {p['retention_ratio']} |")
+        lines.append(f"| {p['pair']} | {p['pre_blocks']} | {p['pre_chars']} | {p['matched_chars']} | {p['retention_ratio']} |")
 
     lines.append(
         "\n---\nThis profile is a brief, not an executor. Hand it to whoever/whatever cuts your "
