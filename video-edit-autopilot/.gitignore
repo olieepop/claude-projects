@@ -1,0 +1,6 @@
+.env
+profiles/
+out/
+assets/
+__pycache__/
+*.pyc
